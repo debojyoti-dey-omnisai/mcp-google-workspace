@@ -1,21 +1,27 @@
 #!/usr/bin/env node
 
-import * as dotenv from 'dotenv';
-import { parseArgs } from 'node:util';
-import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { parse as parseUrl } from 'url';
-import { parse as parseQueryString } from 'querystring';
-import open from 'open';
+import * as dotenv from "dotenv";
+import { parseArgs } from "node:util";
+import { randomUUID } from "node:crypto";
+import { createServer, IncomingMessage, ServerResponse } from "http";
+import { parse as parseUrl } from "url";
+import { parse as parseQueryString } from "querystring";
+import open from "open";
 
 // Load environment variables from .env file as fallback
 dotenv.config();
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { GmailTools } from './tools/gmail.js';
-import { CalendarTools } from './tools/calendar.js';
-import { GAuthService } from './services/gauth.js';
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  isInitializeRequest,
+} from "@modelcontextprotocol/sdk/types.js";
+import { GmailTools } from "./tools/gmail.js";
+import { CalendarTools } from "./tools/calendar.js";
+import { GAuthService } from "./services/gauth.js";
 
 // Configure logging
 const logger = {
@@ -23,7 +29,7 @@ const logger = {
   error: (msg: string, error?: Error) => {
     console.error(`[ERROR] ${msg}`);
     if (error?.stack) console.error(error.stack);
-  }
+  },
 };
 
 interface ServerConfig {
@@ -42,14 +48,14 @@ class OAuthServer {
   }
 
   private async handleRequest(req: IncomingMessage, res: ServerResponse) {
-    const url = parseUrl(req.url || '');
-    if (url.pathname !== '/code') {
+    const url = parseUrl(req.url || "");
+    if (url.pathname !== "/code") {
       res.writeHead(404);
       res.end();
       return;
     }
 
-    const query = parseQueryString(url.query || '');
+    const query = parseQueryString(url.query || "");
     if (!query.code) {
       res.writeHead(400);
       res.end();
@@ -57,7 +63,7 @@ class OAuthServer {
     }
 
     res.writeHead(200);
-    res.write('Auth successful! You can close the tab!');
+    res.write("Auth successful! You can close the tab!");
     res.end();
 
     const storage = {};
@@ -79,15 +85,15 @@ class GoogleWorkspaceServer {
   };
 
   constructor(config: ServerConfig) {
-    logger.info('Starting Google Workspace MCP Server...');
+    logger.info("Starting Google Workspace MCP Server...");
 
     // Initialize services
     this.gauth = new GAuthService(config);
-    
+
     // Initialize server
     this.server = new Server(
       { name: "mcp-google-workspace", version: "1.0.0" },
-      { capabilities: { tools: {} } }
+      { capabilities: { tools: {} } },
     );
   }
 
@@ -95,7 +101,7 @@ class GoogleWorkspaceServer {
     // Initialize tools after OAuth2 client is ready
     this.tools = {
       gmail: new GmailTools(this.gauth),
-      calendar: new CalendarTools(this.gauth)
+      calendar: new CalendarTools(this.gauth),
     };
 
     this.setupHandlers();
@@ -114,8 +120,10 @@ class GoogleWorkspaceServer {
     if (accounts.length === 0) {
       throw new Error("No accounts specified in .gauth.json");
     }
-    if (!accounts.some(a => a.email === userId)) {
-      throw new Error(`Account for email: ${userId} not specified in .gauth.json`);
+    if (!accounts.some((a) => a.email === userId)) {
+      throw new Error(
+        `Account for email: ${userId} not specified in .gauth.json`,
+      );
     }
 
     let credentials = await this.gauth.getStoredCredentials(userId);
@@ -139,34 +147,46 @@ class GoogleWorkspaceServer {
       return {
         tools: [
           ...this.tools.gmail.getTools(),
-          ...this.tools.calendar.getTools()
-        ]
+          ...this.tools.calendar.getTools(),
+        ],
       };
     });
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
-      
+
       try {
-        if (typeof args !== 'object' || args === null) {
+        if (typeof args !== "object" || args === null) {
           return {
             isError: true,
-            content: [{ type: "text", text: JSON.stringify({
-              error: "arguments must be dictionary",
-              success: false
-            }, null, 2) }]
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    error: "arguments must be dictionary",
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
           };
         }
 
         // Special case for list_accounts tools which don't require user_id
-        if (name === 'gmail_list_accounts' || name === 'calendar_list_accounts') {
+        if (
+          name === "gmail_list_accounts" ||
+          name === "calendar_list_accounts"
+        ) {
           try {
             // Route tool calls to appropriate handler
             let result;
-            if (name.startsWith('gmail_')) {
+            if (name.startsWith("gmail_")) {
               result = await this.tools.gmail.handleTool(name, args);
-            } else if (name.startsWith('calendar_')) {
+            } else if (name.startsWith("calendar_")) {
               result = await this.tools.calendar.handleTool(name, args);
             } else {
               throw new Error(`Unknown tool: ${name}`);
@@ -177,10 +197,19 @@ class GoogleWorkspaceServer {
             logger.error(`Error handling tool ${name}:`, error as Error);
             return {
               isError: true,
-              content: [{ type: "text", text: JSON.stringify({
-                error: `Tool execution failed: ${(error as Error).message}`,
-                success: false
-              }, null, 2) }]
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      error: `Tool execution failed: ${(error as Error).message}`,
+                      success: false,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
             };
           }
         }
@@ -189,10 +218,19 @@ class GoogleWorkspaceServer {
         if (!args.user_id) {
           return {
             isError: true,
-            content: [{ type: "text", text: JSON.stringify({
-              error: "user_id argument is missing in dictionary",
-              success: false
-            }, null, 2) }]
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    error: "user_id argument is missing in dictionary",
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
           };
         }
 
@@ -202,19 +240,28 @@ class GoogleWorkspaceServer {
           logger.error("OAuth2 setup failed:", error as Error);
           return {
             isError: true,
-            content: [{ type: "text", text: JSON.stringify({
-              error: `OAuth2 setup failed: ${(error as Error).message}`,
-              success: false
-            }, null, 2) }]
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    error: `OAuth2 setup failed: ${(error as Error).message}`,
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
           };
         }
 
         // Route tool calls to appropriate handler
         try {
           let result;
-          if (name.startsWith('gmail_')) {
+          if (name.startsWith("gmail_")) {
             result = await this.tools.gmail.handleTool(name, args);
-          } else if (name.startsWith('calendar_')) {
+          } else if (name.startsWith("calendar_")) {
             result = await this.tools.calendar.handleTool(name, args);
           } else {
             throw new Error(`Unknown tool: ${name}`);
@@ -225,26 +272,44 @@ class GoogleWorkspaceServer {
           logger.error(`Error handling tool ${name}:`, error as Error);
           return {
             isError: true,
-            content: [{ type: "text", text: JSON.stringify({
-              error: `Tool execution failed: ${(error as Error).message}`,
-              success: false
-            }, null, 2) }]
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    error: `Tool execution failed: ${(error as Error).message}`,
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
           };
         }
       } catch (error) {
         logger.error("Unexpected error in call_tool:", error as Error);
         return {
           isError: true,
-          content: [{ type: "text", text: JSON.stringify({
-            error: `Unexpected error: ${(error as Error).message}`,
-            success: false
-          }, null, 2) }]
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  error: `Unexpected error: ${(error as Error).message}`,
+                  success: false,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
         };
       }
     });
   }
 
-  async start() {
+  async start(mode: "stdio" | "http" = "stdio", httpPort: number = 4200) {
     try {
       // Initialize OAuth2 client first
       await this.gauth.initialize();
@@ -261,15 +326,350 @@ class GoogleWorkspaceServer {
         }
       }
 
-      // Start server
-      const transport = new StdioServerTransport();
-      logger.info('Connecting to transport...');
-      await this.server.connect(transport);
-      logger.info('Server ready!');
+      if (mode === "http") {
+        await this.startHTTP(httpPort);
+      } else {
+        // Start stdio transport
+        const transport = new StdioServerTransport();
+        logger.info("Connecting to stdio transport...");
+        await this.server.connect(transport);
+        logger.info("Server ready (stdio)!");
+      }
     } catch (error) {
       logger.error("Server error:", error as Error);
-      throw error; // Let the error propagate to stop the server
+      throw error;
     }
+  }
+
+  private async startHTTP(port: number) {
+    // Map of session ID -> transport
+    const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+    const httpServer = createServer(
+      async (req: IncomingMessage, res: ServerResponse) => {
+        const url = parseUrl(req.url || "");
+
+        // OAuth callback on /code (reuse existing port for convenience)
+        if (url.pathname === "/code") {
+          const query = parseQueryString(url.query || "");
+          if (!query.code) {
+            res.writeHead(400);
+            res.end();
+            return;
+          }
+          res.writeHead(200);
+          res.write("Auth successful! You can close the tab!");
+          res.end();
+          const storage = {};
+          await this.gauth.getCredentials(query.code as string, storage);
+          return;
+        }
+
+        // Only handle /mcp path
+        if (url.pathname !== "/mcp") {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: "Not found. Use /mcp endpoint." }));
+          return;
+        }
+
+        // CORS headers
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader(
+          "Access-Control-Allow-Methods",
+          "GET, POST, DELETE, OPTIONS",
+        );
+        res.setHeader(
+          "Access-Control-Allow-Headers",
+          "Content-Type, mcp-session-id",
+        );
+        res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
+
+        if (req.method === "OPTIONS") {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+        if (req.method === "GET") {
+          // SSE stream for existing session
+          if (!sessionId || !transports[sessionId]) {
+            res.writeHead(400);
+            res.end("Invalid or missing session ID");
+            return;
+          }
+          await transports[sessionId].handleRequest(req, res);
+          return;
+        }
+
+        if (req.method === "DELETE") {
+          // Session termination
+          if (!sessionId || !transports[sessionId]) {
+            res.writeHead(400);
+            res.end("Invalid or missing session ID");
+            return;
+          }
+          await transports[sessionId].handleRequest(req, res);
+          return;
+        }
+
+        if (req.method === "POST") {
+          // Read request body
+          const body = await new Promise<string>((resolve) => {
+            let data = "";
+            req.on("data", (chunk: Buffer) => {
+              data += chunk.toString();
+            });
+            req.on("end", () => resolve(data));
+          });
+
+          let parsedBody: unknown;
+          try {
+            parsedBody = JSON.parse(body);
+          } catch {
+            res.writeHead(400);
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32700, message: "Parse error" },
+                id: null,
+              }),
+            );
+            return;
+          }
+
+          let transport: StreamableHTTPServerTransport;
+
+          if (sessionId && transports[sessionId]) {
+            // Reuse existing transport
+            transport = transports[sessionId];
+          } else if (!sessionId && isInitializeRequest(parsedBody)) {
+            // New initialization request — create new transport + server
+            transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: (newSessionId: string) => {
+                logger.info(`Session initialized: ${newSessionId}`);
+                transports[newSessionId] = transport;
+              },
+            });
+
+            transport.onclose = () => {
+              const sid = transport.sessionId;
+              if (sid && transports[sid]) {
+                logger.info(`Session closed: ${sid}`);
+                delete transports[sid];
+              }
+            };
+
+            // Create a fresh MCP Server instance for this session and connect
+            const sessionServer = new Server(
+              { name: "mcp-google-workspace", version: "1.0.0" },
+              { capabilities: { tools: {} } },
+            );
+            this.setupHandlersOnServer(sessionServer);
+            await sessionServer.connect(transport);
+          } else {
+            res.writeHead(400);
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: {
+                  code: -32000,
+                  message: "Bad Request: No valid session ID provided",
+                },
+                id: null,
+              }),
+            );
+            return;
+          }
+
+          await transport.handleRequest(req, res, parsedBody);
+          return;
+        }
+
+        res.writeHead(405);
+        res.end("Method not allowed");
+      },
+    );
+
+    httpServer.listen(port, () => {
+      logger.info(`MCP Streamable HTTP Server listening on port ${port}`);
+      logger.info(`Endpoint: http://localhost:${port}/mcp`);
+    });
+
+    process.on("SIGINT", async () => {
+      logger.info("Shutting down...");
+      for (const sid in transports) {
+        await transports[sid].close();
+        delete transports[sid];
+      }
+      httpServer.close();
+      process.exit(0);
+    });
+  }
+
+  /**
+   * Set up tool handlers on a given Server instance.
+   * Used by HTTP mode to create per-session server instances.
+   */
+  private setupHandlersOnServer(server: Server) {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      return {
+        tools: [
+          ...this.tools.gmail.getTools(),
+          ...this.tools.calendar.getTools(),
+        ],
+      };
+    });
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+
+      try {
+        if (typeof args !== "object" || args === null) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  { error: "arguments must be dictionary", success: false },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        // list_accounts tools don't require user_id
+        if (
+          name === "gmail_list_accounts" ||
+          name === "calendar_list_accounts"
+        ) {
+          try {
+            let result;
+            if (name.startsWith("gmail_")) {
+              result = await this.tools.gmail.handleTool(name, args);
+            } else if (name.startsWith("calendar_")) {
+              result = await this.tools.calendar.handleTool(name, args);
+            } else {
+              throw new Error(`Unknown tool: ${name}`);
+            }
+            return { content: result };
+          } catch (error) {
+            logger.error(`Error handling tool ${name}:`, error as Error);
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      error: `Tool execution failed: ${(error as Error).message}`,
+                      success: false,
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
+        }
+
+        // All other tools require user_id
+        if (!args.user_id) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    error: "user_id argument is missing in dictionary",
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        try {
+          await this.setupOAuth2(args.user_id as string);
+        } catch (error) {
+          logger.error("OAuth2 setup failed:", error as Error);
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    error: `OAuth2 setup failed: ${(error as Error).message}`,
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        try {
+          let result;
+          if (name.startsWith("gmail_")) {
+            result = await this.tools.gmail.handleTool(name, args);
+          } else if (name.startsWith("calendar_")) {
+            result = await this.tools.calendar.handleTool(name, args);
+          } else {
+            throw new Error(`Unknown tool: ${name}`);
+          }
+          return { content: result };
+        } catch (error) {
+          logger.error(`Error handling tool ${name}:`, error as Error);
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    error: `Tool execution failed: ${(error as Error).message}`,
+                    success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+      } catch (error) {
+        logger.error("Unexpected error in call_tool:", error as Error);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  error: `Unexpected error: ${(error as Error).message}`,
+                  success: false,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+    });
   }
 }
 
@@ -277,21 +677,26 @@ class GoogleWorkspaceServer {
 const { values } = parseArgs({
   args: process.argv.slice(2),
   options: {
-    'gauth-file': { type: 'string', default: './.gauth.json' },
-    'accounts-file': { type: 'string', default: './.accounts.json' },
-    'credentials-dir': { type: 'string', default: '.' }
-  }
+    "gauth-file": { type: "string", default: "./.gauth.json" },
+    "accounts-file": { type: "string", default: "./.accounts.json" },
+    "credentials-dir": { type: "string", default: "." },
+    http: { type: "boolean", default: false },
+    port: { type: "string", default: "4200" },
+  },
 });
 
 const config: ServerConfig = {
-  gauthFile: values['gauth-file'] as string,
-  accountsFile: values['accounts-file'] as string,
-  credentialsDir: values['credentials-dir'] as string
+  gauthFile: values["gauth-file"] as string,
+  accountsFile: values["accounts-file"] as string,
+  credentialsDir: values["credentials-dir"] as string,
 };
 
+const transportMode = values["http"] ? "http" : "stdio";
+const httpPort = parseInt(values["port"] as string, 10) || 4200;
+
 // Start the server
-const server = new GoogleWorkspaceServer(config);
-server.start().catch(error => {
+const wsServer = new GoogleWorkspaceServer(config);
+wsServer.start(transportMode as "stdio" | "http", httpPort).catch((error) => {
   logger.error("Fatal error:", error as Error);
   process.exit(1);
 });

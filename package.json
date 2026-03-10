@@ -19,7 +19,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "latest",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "axios": "^1.6.0",
     "dotenv": "^16.0.0",
     "googleapis": "^133.0.0",
@@ -34,6 +34,8 @@
     "prepublishOnly": "npm run build",
     "build": "tsc",
     "start": "node --loader ts-node/esm src/server.ts",
-    "dev": "node --loader ts-node/esm src/server.ts"
+    "start:http": "node --loader ts-node/esm src/server.ts --http --port 4200",
+    "dev": "node --loader ts-node/esm src/server.ts",
+    "dev:http": "node --loader ts-node/esm src/server.ts --http --port 4200"
   }
 }
