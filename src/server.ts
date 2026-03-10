@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { parse as parseUrl } from "url";
 import { parse as parseQueryString } from "querystring";
-import open from "open";
+// open is no longer used — auth URL is returned to the client instead
 
 // Load environment variables from .env file as fallback
 dotenv.config();
@@ -107,15 +107,10 @@ class GoogleWorkspaceServer {
     this.setupHandlers();
   }
 
-  private async startAuthFlow(userId: string) {
-    const authUrl = await this.gauth.getAuthorizationUrl(userId, {});
-    open(authUrl);
-
-    const oauthServer = new OAuthServer(this.gauth);
-    oauthServer.listen(4100);
-  }
-
-  private async setupOAuth2(userId: string) {
+  /**
+   * Returns the auth URL if credentials are missing or expired, or null if auth is ready.
+   */
+  private async setupOAuth2(userId: string): Promise<string | null> {
     const accounts = await this.gauth.getAccountInfo();
     if (accounts.length === 0) {
       throw new Error("No accounts specified in .gauth.json");
@@ -128,17 +123,42 @@ class GoogleWorkspaceServer {
 
     let credentials = await this.gauth.getStoredCredentials(userId);
     if (!credentials) {
-      await this.startAuthFlow(userId);
-    } else {
-      const tokens = credentials.credentials;
-      if (tokens.expiry_date && tokens.expiry_date < Date.now()) {
-        logger.error("credentials expired, trying refresh");
-      }
-
-      // Refresh access token if needed
-      const userInfo = await this.gauth.getUserInfo(credentials);
-      await this.gauth.storeCredentials(credentials, userId);
+      const authUrl = await this.gauth.getAuthorizationUrl(userId, {});
+      // Start the OAuth callback server so the redirect works
+      const oauthServer = new OAuthServer(this.gauth);
+      oauthServer.listen(4100);
+      return authUrl;
     }
+
+    const tokens = credentials.credentials;
+    if (tokens.expiry_date && tokens.expiry_date < Date.now()) {
+      logger.info("Access token expired, refreshing...");
+      try {
+        const { credentials: newTokens } = await credentials.refreshAccessToken();
+        credentials.setCredentials(newTokens);
+        await this.gauth.storeCredentials(credentials, userId);
+      } catch (error) {
+        logger.error("Token refresh failed, re-authentication required");
+        const authUrl = await this.gauth.getAuthorizationUrl(userId, {});
+        const oauthServer = new OAuthServer(this.gauth);
+        oauthServer.listen(4100);
+        return authUrl;
+      }
+    }
+
+    // Verify credentials still work
+    try {
+      await this.gauth.getUserInfo(credentials);
+      await this.gauth.storeCredentials(credentials, userId);
+    } catch (error) {
+      logger.error("Credentials invalid, re-authentication required");
+      const authUrl = await this.gauth.getAuthorizationUrl(userId, {});
+      const oauthServer = new OAuthServer(this.gauth);
+      oauthServer.listen(4100);
+      return authUrl;
+    }
+
+    return null;
   }
 
   private setupHandlers() {
@@ -234,8 +254,9 @@ class GoogleWorkspaceServer {
           };
         }
 
+        let authUrl: string | null;
         try {
-          await this.setupOAuth2(args.user_id as string);
+          authUrl = await this.setupOAuth2(args.user_id as string);
         } catch (error) {
           logger.error("OAuth2 setup failed:", error as Error);
           return {
@@ -247,6 +268,27 @@ class GoogleWorkspaceServer {
                   {
                     error: `OAuth2 setup failed: ${(error as Error).message}`,
                     success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        // If auth URL returned, user needs to authenticate first
+        if (authUrl) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    requires_auth: true,
+                    auth_url: authUrl,
+                    message: `Authentication required for ${args.user_id}. Please visit the following URL to authorize access:`,
                   },
                   null,
                   2,
@@ -348,6 +390,84 @@ class GoogleWorkspaceServer {
     const httpServer = createServer(
       async (req: IncomingMessage, res: ServerResponse) => {
         const url = parseUrl(req.url || "");
+
+        // Health check endpoint for external monitoring
+        if (url.pathname === "/health") {
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Content-Type", "application/json");
+          const accounts = await this.gauth.getAccountInfo();
+          const accountStatuses = [];
+          for (const account of accounts) {
+            const creds = await this.gauth.getStoredCredentials(account.email);
+            accountStatuses.push({
+              email: account.email,
+              authenticated: !!creds,
+              needs_auth: !creds,
+            });
+          }
+          res.writeHead(200);
+          res.end(JSON.stringify({
+            status: "ok",
+            server: "mcp-google-workspace",
+            version: "1.0.0",
+            accounts: accountStatuses,
+            tools: [
+              ...this.tools.gmail.getTools().map((t: any) => t.name),
+              ...this.tools.calendar.getTools().map((t: any) => t.name),
+            ],
+          }));
+          return;
+        }
+
+        // Auth URL endpoint — returns Google OAuth URL for a given email
+        if (url.pathname === "/auth-url") {
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Content-Type", "application/json");
+          const query = parseQueryString(url.query || "");
+          const email = query.email as string;
+          if (!email) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ success: false, error: "Missing 'email' query parameter" }));
+            return;
+          }
+          try {
+            // Check if already authenticated
+            const creds = await this.gauth.getStoredCredentials(email);
+            if (creds) {
+              try {
+                await this.gauth.getUserInfo(creds);
+                res.writeHead(200);
+                res.end(JSON.stringify({
+                  success: true,
+                  authenticated: true,
+                  email,
+                  message: `Already authenticated for ${email}`,
+                }));
+                return;
+              } catch {
+                // Credentials invalid, need re-auth
+              }
+            }
+            const authUrl = await this.gauth.getAuthorizationUrl(email, {});
+            // Start callback server for the redirect
+            const oauthServer = new OAuthServer(this.gauth);
+            oauthServer.listen(4100);
+            res.writeHead(200);
+            res.end(JSON.stringify({
+              success: true,
+              authenticated: false,
+              email,
+              auth_url: authUrl,
+              auth_type: "google_oauth",
+              callback_url: "http://localhost:4100/code",
+              message: `Visit the auth_url to authenticate ${email} with Google`,
+            }));
+          } catch (error) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ success: false, error: (error as Error).message }));
+          }
+          return;
+        }
 
         // OAuth callback on /code (reuse existing port for convenience)
         if (url.pathname === "/code") {
@@ -599,8 +719,9 @@ class GoogleWorkspaceServer {
           };
         }
 
+        let authUrl: string | null;
         try {
-          await this.setupOAuth2(args.user_id as string);
+          authUrl = await this.setupOAuth2(args.user_id as string);
         } catch (error) {
           logger.error("OAuth2 setup failed:", error as Error);
           return {
@@ -612,6 +733,27 @@ class GoogleWorkspaceServer {
                   {
                     error: `OAuth2 setup failed: ${(error as Error).message}`,
                     success: false,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        // If auth URL returned, user needs to authenticate first
+        if (authUrl) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    success: false,
+                    requires_auth: true,
+                    auth_url: authUrl,
+                    message: `Authentication required for ${args.user_id}. Please visit the following URL to authorize access:`,
                   },
                   null,
                   2,

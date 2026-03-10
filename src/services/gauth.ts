@@ -90,7 +90,7 @@ export class GAuthService {
   }
 
   private getCredentialFilename(userId: string): string {
-    return path.join(this.config.credentialsDir, `.oauth2.${userId}.json`);
+    return path.resolve(process.cwd(), this.config.credentialsDir, `.oauth2.${userId}.json`);
   }
 
   async getAccountInfo(): Promise<AccountInfo[]> {
